@@ -3,6 +3,9 @@
 #include <vector>
 #include <vulkan/vulkan_raii.hpp>
 
+#include "pattern_cb_cr.h"
+#include "pattern_y.h"
+
 struct queue {
     vk::raii::Queue queue;
     uint32_t familyIndex;
@@ -12,8 +15,10 @@ auto make_device(vk::raii::Instance& instance) {
     vk::raii::PhysicalDevices physicalDevices(instance);
     for (const auto& d : physicalDevices) {
         auto props = d.enumerateDeviceExtensionProperties();
-        auto [feat, feat_13] =
+        auto [feat, feat_11, feat_12, feat_13] =
             d.getFeatures2<vk::PhysicalDeviceFeatures2,
+                           vk::PhysicalDeviceVulkan11Features,
+                           vk::PhysicalDeviceVulkan12Features,
                            vk::PhysicalDeviceVulkan13Features>();
         if (not feat_13.synchronization2) continue;
         vk::DeviceCreateInfo create_info{.pNext = &feat};
@@ -147,7 +152,6 @@ auto create_src_image(const vk::VideoProfileListInfoKHR& prof,
         img_view_create_info.components = video_fmt_prop.componentMapping;
         break;
     }
-
     vk::raii::Image img_in(dev, img_create_info);
 
     auto mem_req = img_in.getMemoryRequirements();
@@ -156,8 +160,7 @@ auto create_src_image(const vk::VideoProfileListInfoKHR& prof,
         .allocationSize = mem_req.size,
         .memoryTypeIndex =
             get_memory_type(phys_dev, mem_req.memoryTypeBits,
-                            vk::MemoryPropertyFlagBits::eHostVisible &
-                                vk::MemoryPropertyFlagBits::eHostCoherent),
+                            vk::MemoryPropertyFlagBits::eDeviceLocal),
     };
 
     vk::raii::DeviceMemory img_mem(dev, alloc_info);
@@ -167,7 +170,8 @@ auto create_src_image(const vk::VideoProfileListInfoKHR& prof,
     vk::raii::ImageView img_view(dev, img_view_create_info);
 
     return std::make_tuple(std::move(img_in), std::move(img_mem),
-                           std::move(img_view), img_create_info.format);
+                           std::move(img_view),
+                           img_create_info.format);
 }
 
 auto create_dpb_images(const vk::VideoProfileListInfoKHR& prof,
@@ -299,13 +303,24 @@ class slot_info {
 class test_pattern {
     vk::raii::Image& target_img;
     vk::Extent2D extent;
-    vk::raii::Buffer buf = nullptr;
-    vk::raii::DeviceMemory mem = nullptr;
-    size_t counter = 0;
 
-    inline static const std::array y = {940, 877, 754, 691, 313, 250, 127, 64};
-    inline static const std::array cb = {512, 64, 615, 167, 857, 409, 960, 512};
-    inline static const std::array cr = {512, 553, 64, 105, 919, 960, 471, 512};
+    vk::raii::Image img_y = nullptr;
+    vk::raii::Image img_uv = nullptr;
+    vk::raii::DeviceMemory mem = nullptr;
+    vk::raii::ImageView view_y = nullptr;
+    vk::raii::ImageView view_uv = nullptr;
+
+    vk::raii::DescriptorSetLayout ds_layout = nullptr;
+    vk::raii::PipelineLayout layout = nullptr;
+
+    vk::raii::Pipeline pipeline_y = nullptr;
+    vk::raii::Pipeline pipeline_cb_cr = nullptr;
+    vk::raii::DescriptorPool dp = nullptr;
+    vk::raii::DescriptorSet ds_y = nullptr;
+    vk::raii::DescriptorSet ds_cb_cr = nullptr;
+
+    using push_constant = uint32_t;
+    uint32_t counter = 0;
 
    public:
     test_pattern(vk::raii::PhysicalDevice& phys_dev, vk::raii::Device& dev,
@@ -314,40 +329,198 @@ class test_pattern {
         : target_img(target_img), extent(extent) {
         assert(fmt == vk::Format::eG8B8R82Plane420Unorm);
 
-        buf = vk::raii::Buffer(
-            dev, {
-                     .size = extent.width * extent.height,
-                     .usage = vk::BufferUsageFlagBits::eTransferSrc |
-                              vk::BufferUsageFlagBits::eTransferDst,
-                     .sharingMode = vk::SharingMode::eExclusive,
-                 });
+        vk::ImageCreateInfo img_create_info{
+            .imageType = vk::ImageType::e2D,
+            .extent = {extent.width, extent.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eStorage |
+                     vk::ImageUsageFlagBits::eTransferSrc,
+            .sharingMode = vk::SharingMode::eExclusive,
+        };
 
-        auto mem_req = buf.getMemoryRequirements();
+        std::array formats = {vk::Format::eR8Unorm, vk::Format::eR8G8Unorm};
+
+        size_t alloc_size = 0;
+        std::vector<size_t> offsets;
+
+        std::optional<vk::MemoryRequirements> mem_req;
+
+        for (int i = 0; i < 2; ++i) {
+            auto& img = i == 0 ? img_y : img_uv;
+            img_create_info.format = formats[i];
+            if (i == 1) {
+                img_create_info.extent.width /= 2;
+                img_create_info.extent.height /= 2;
+            }
+            img = vk::raii::Image(dev, img_create_info);
+
+            auto req = img.getMemoryRequirements();
+            if (mem_req) {
+                assert(req.memoryTypeBits == mem_req->memoryTypeBits);
+            } else {
+                mem_req = req;
+            }
+            size_t offset =
+                ((alloc_size - 1) / req.alignment + 1) * req.alignment;
+            offsets.push_back(offset);
+            alloc_size = offset + req.size;
+        }
 
         vk::MemoryAllocateInfo alloc_info{
-            .allocationSize = mem_req.size,
+            .allocationSize = alloc_size,
             .memoryTypeIndex =
-                get_memory_type(phys_dev, mem_req.memoryTypeBits,
+                get_memory_type(phys_dev, mem_req->memoryTypeBits,
                                 vk::MemoryPropertyFlagBits::eDeviceLocal),
         };
 
         mem = vk::raii::DeviceMemory(dev, alloc_info);
-        buf.bindMemory(*mem, 0);
+
+        for (int i = 0; i < 2; ++i) {
+            auto& img = i == 0 ? img_y : img_uv;
+            auto& view = i == 0 ? view_y : view_uv;
+            img.bindMemory(*mem, offsets[i]);
+
+            view = vk::raii::ImageView(
+                dev,
+                {
+                    .image = *img,
+                    .viewType = vk::ImageViewType::e2D,
+                    .format = formats[i],
+                    .subresourceRange = {.aspectMask =
+                                             vk::ImageAspectFlagBits::eColor,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1},
+                });
+        }
+
+        vk::DescriptorSetLayoutBinding ds_layout_binding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        };
+
+        ds_layout = vk::raii::DescriptorSetLayout(
+            dev, {
+                     .bindingCount = 1,
+                     .pBindings = &ds_layout_binding,
+                 });
+
+        vk::PushConstantRange pc_range{
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            .offset = 0,
+            .size = sizeof(push_constant),
+        };
+
+        layout =
+            vk::raii::PipelineLayout(dev, {
+                                              .setLayoutCount = 1,
+                                              .pSetLayouts = &*ds_layout,
+                                              .pushConstantRangeCount = 1,
+                                              .pPushConstantRanges = &pc_range,
+                                          });
+
+        {
+            vk::raii::ShaderModule shader(
+                dev, vk::ShaderModuleCreateInfo{
+                         .codeSize = sizeof(spirv_pattern_y),
+                         .pCode = spirv_pattern_y,
+                     });
+
+            pipeline_y = vk::raii::Pipeline(
+                dev, nullptr,
+                vk::ComputePipelineCreateInfo{
+                    .stage =
+                        {
+                            .stage = vk::ShaderStageFlagBits::eCompute,
+                            .module = *shader,
+                            .pName = "main",
+                        },
+                    .layout = *layout,
+                });
+        }
+        {
+            vk::raii::ShaderModule shader(
+                dev, vk::ShaderModuleCreateInfo{
+                         .codeSize = sizeof(spirv_pattern_cb_cr),
+                         .pCode = spirv_pattern_cb_cr,
+                     });
+
+            pipeline_cb_cr = vk::raii::Pipeline(
+                dev, nullptr,
+                vk::ComputePipelineCreateInfo{
+                    .stage =
+                        {
+                            .stage = vk::ShaderStageFlagBits::eCompute,
+                            .module = *shader,
+                            .pName = "main",
+                        },
+                    .layout = *layout,
+                });
+        }
+
+        vk::DescriptorPoolSize pool_size{
+            .type = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 2,
+        };
+
+        dp = vk::raii::DescriptorPool(dev, {
+                                               .maxSets = 2,
+                                               .poolSizeCount = 1,
+                                               .pPoolSizes = &pool_size,
+                                           });
+
+        std::array ds_layouts = {*ds_layout, *ds_layout};
+        auto sets = dev.allocateDescriptorSets({
+            .descriptorPool = *dp,
+            .descriptorSetCount = 2,
+            .pSetLayouts = ds_layouts.data(),
+        });
+        ds_y = std::move(sets[0]);
+        ds_cb_cr = std::move(sets[1]);
+
+        vk::DescriptorImageInfo desc_img_info_y{
+            .imageView = *view_y,
+            .imageLayout = vk::ImageLayout::eGeneral,
+        };
+        vk::DescriptorImageInfo desc_img_info_cb_cr{
+            .imageView = *view_uv,
+            .imageLayout = vk::ImageLayout::eGeneral,
+        };
+
+        dev.updateDescriptorSets(
+            {
+                vk::WriteDescriptorSet{
+                    .dstSet = *ds_y,
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageImage,
+                    .pImageInfo = &desc_img_info_y,
+                },
+                vk::WriteDescriptorSet{
+                    .dstSet = *ds_cb_cr,
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageImage,
+                    .pImageInfo = &desc_img_info_cb_cr,
+                },
+            },
+            nullptr);
     }
     void draw(vk::raii::CommandBuffer& cmd_buf, uint32_t src_queue,
               uint32_t dst_queue) {
-        static const int freq = 200;
-        size_t shift = (counter / freq) % y.size();
-        size_t offset = counter % freq;
-        ++counter;
+        counter += 10;
 
-        uint32_t bar_y_w = extent.width / y.size();
-
-        vk::ImageMemoryBarrier2 im_barrier{
+        std::array im_barriers = {
+        vk::ImageMemoryBarrier2 {
             .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
             .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
             .oldLayout = vk::ImageLayout::eUndefined,
             .newLayout = vk::ImageLayout::eTransferDstOptimal,
             .image = *target_img,
@@ -356,100 +529,107 @@ class test_pattern {
                                  .levelCount = 1,
                                  .baseArrayLayer = 0,
                                  .layerCount = 1},
+        },
+        vk::ImageMemoryBarrier2 {
+            .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = *img_y,
+            .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                 .baseMipLevel = 0,
+                                 .levelCount = 1,
+                                 .baseArrayLayer = 0,
+                                 .layerCount = 1},
+        },
+        vk::ImageMemoryBarrier2 {
+            .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = *img_uv,
+            .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                 .baseMipLevel = 0,
+                                 .levelCount = 1,
+                                 .baseArrayLayer = 0,
+                                 .layerCount = 1},
+        },
         };
-
-        vk::BufferMemoryBarrier2 buf_barrier{
-            .srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite |
-                             vk::AccessFlagBits2::eTransferRead,
-            .dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite |
-                             vk::AccessFlagBits2::eTransferRead,
-            .buffer = *buf,
-            .size = vk::WholeSize,
-        };
+        auto & [target_barrier, y_barrier, uv_barrier] = im_barriers;
         vk::DependencyInfo dep_info{};
-        dep_info.setImageMemoryBarriers(im_barrier);
+        std::span yuv_barriers(im_barriers.begin() + 1, im_barriers.end());
+        dep_info.setImageMemoryBarriers(yuv_barriers);
         cmd_buf.pipelineBarrier2(dep_info);
 
-        for (size_t i = 0; i < y.size(); ++i) {
-            size_t j = (i + shift) % y.size();
+        cmd_buf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline_y);
+        cmd_buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0,
+                                   *ds_y, {});
+        cmd_buf.pushConstants<push_constant>(
+            *layout, vk::ShaderStageFlagBits::eCompute, 0, counter);
+        cmd_buf.dispatch(extent.width, extent.height, 1);
 
-            im_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
-            im_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-            im_barrier.dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
-            im_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
-            im_barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-            im_barrier.newLayout = vk::ImageLayout::eTransferDstOptimal;
-            dep_info.setBufferMemoryBarriers(buf_barrier);
+        cmd_buf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline_cb_cr);
+        cmd_buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0,
+                                   *ds_cb_cr, {});
+        cmd_buf.pushConstants<push_constant>(
+            *layout, vk::ShaderStageFlagBits::eCompute, 0, counter/2);
+        cmd_buf.dispatch(extent.width/2, extent.height/2, 1);
 
-            uint32_t data;
-            std::array<uint8_t, 4> val;
-            val.fill((y[j] * 256) / 1024);
-            std::memcpy(&data, val.data(), sizeof(data));
+        y_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader;
+        y_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite;
+        y_barrier.dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
+        y_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+        y_barrier.oldLayout = vk::ImageLayout::eGeneral;
+        y_barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
 
-            cmd_buf.fillBuffer(*buf, 0, vk::WholeSize, data);
-            cmd_buf.pipelineBarrier2(dep_info);
+        uv_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader;
+        uv_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite;
+        uv_barrier.dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
+        uv_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+        uv_barrier.oldLayout = vk::ImageLayout::eGeneral;
+        uv_barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
 
-            vk::BufferImageCopy region{
-                .imageSubresource =
-                    {
-                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
-                        .mipLevel = 0,
-                        .baseArrayLayer = 0,
-                        .layerCount = 1,
-                    },
-                .imageOffset = {.x = int32_t(offset + (i - 1) * bar_y_w),
-                                .y = 0,
-                                .z = 0},
-                .imageExtent = {.width = bar_y_w,
-                                .height = extent.height,
-                                .depth = 1},
-            };
-            if (i == 0) {
-                region.imageOffset.x = 0;
-                cmd_buf.copyBufferToImage(*buf, *target_img,
-                                          vk::ImageLayout::eTransferDstOptimal,
-                                          region);
-                region.imageOffset.x = extent.width - bar_y_w;
-                cmd_buf.pipelineBarrier2(dep_info);
-            }
-            cmd_buf.copyBufferToImage(*buf, *target_img,
-                                      vk::ImageLayout::eTransferDstOptimal,
-                                      region);
-            cmd_buf.pipelineBarrier2(dep_info);
+        dep_info.setImageMemoryBarriers(im_barriers);
+        cmd_buf.pipelineBarrier2(dep_info);
+        cmd_buf.copyImage(
+            *img_y, vk::ImageLayout::eTransferSrcOptimal, *target_img,
+            vk::ImageLayout::eTransferDstOptimal,
+            vk::ImageCopy{
+                .srcSubresource = {.aspectMask =
+                                       vk::ImageAspectFlagBits::eColor,
+                                       .layerCount = 1},
+                .dstSubresource = {.aspectMask =
+                                       vk::ImageAspectFlagBits::ePlane0,
+                                       .layerCount = 1},
+                .extent = {extent.width, extent.height, 1},
+            });
+        cmd_buf.copyImage(
+            *img_uv, vk::ImageLayout::eTransferSrcOptimal, *target_img,
+            vk::ImageLayout::eTransferDstOptimal,
+            vk::ImageCopy{
+                .srcSubresource = {.aspectMask =
+                                       vk::ImageAspectFlagBits::eColor,
+                                       .layerCount = 1},
+                .dstSubresource = {.aspectMask =
+                                       vk::ImageAspectFlagBits::ePlane1,
+                                       .layerCount = 1},
+                .extent = {extent.width/2, extent.height/2, 1},
+            });
 
-            val[2] = val[0] = (cb[j] * 256) / 1024;
-            val[3] = val[1] = (cr[j] * 256) / 1024;
-            std::memcpy(&data, val.data(), sizeof(data));
-            cmd_buf.fillBuffer(*buf, 0, vk::WholeSize, data);
-            cmd_buf.pipelineBarrier2(dep_info);
+        target_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
+        target_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        target_barrier.dstStageMask = vk::PipelineStageFlagBits2KHR::eTopOfPipe;
+        target_barrier.dstAccessMask = vk::AccessFlagBits2::eNone;
+        target_barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+        target_barrier.newLayout = vk::ImageLayout::eVideoEncodeSrcKHR;
+        target_barrier.srcQueueFamilyIndex = src_queue;
+        target_barrier.dstQueueFamilyIndex = dst_queue;
 
-            region.imageSubresource.aspectMask =
-                vk::ImageAspectFlagBits::ePlane1;
-            region.imageOffset.x /= 2;
-            region.imageExtent.width /= 2;
-            region.imageExtent.height /= 2;
-            if (i == 0) {
-                cmd_buf.copyBufferToImage(*buf, *target_img,
-                                          vk::ImageLayout::eTransferDstOptimal,
-                                          region);
-                region.imageOffset.x = 0;
-                cmd_buf.pipelineBarrier2(dep_info);
-            }
-            cmd_buf.copyBufferToImage(*buf, *target_img,
-                                      vk::ImageLayout::eTransferDstOptimal,
-                                      region);
-            cmd_buf.pipelineBarrier2(dep_info);
-        }
-        im_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
-        im_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-        im_barrier.dstStageMask = vk::PipelineStageFlagBits2KHR::eTopOfPipe;
-        im_barrier.dstAccessMask = vk::AccessFlagBits2::eNone;
-        im_barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-        im_barrier.newLayout = vk::ImageLayout::eVideoEncodeSrcKHR;
-        im_barrier.setSrcQueueFamilyIndex(src_queue);
-        im_barrier.setDstQueueFamilyIndex(dst_queue);
+        dep_info.setImageMemoryBarriers(target_barrier);
         cmd_buf.pipelineBarrier2(dep_info);
     }
 };
@@ -505,10 +685,11 @@ int main(int /*argc*/, char** /*argv*/) {
         std::cerr << "std header " << video_caps.stdHeaderVersion.specVersion
                   << std::endl;
 
-        auto [img_in, img_in_mem, img_in_view, img_fmt] =
-            create_src_image(prof, extent, phys_dev, dev);
+        auto [img_in, img_in_mem, img_in_view, 
+              img_fmt] = create_src_image(prof, extent, phys_dev, dev);
 
-        test_pattern pattern(phys_dev, dev, img_in, img_fmt, extent);
+        test_pattern pattern(phys_dev, dev, img_in, img_fmt,
+                             extent);
 
         auto [dpb, dpb_mem, dpb_fmt] =
             create_dpb_images(prof, extent, phys_dev, dev, 2);
