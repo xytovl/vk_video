@@ -12,9 +12,10 @@ auto make_device(vk::raii::Instance& instance) {
     vk::raii::PhysicalDevices physicalDevices(instance);
     for (const auto& d : physicalDevices) {
         auto props = d.enumerateDeviceExtensionProperties();
-        auto [feat, feat_13] = d.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features>();
-        if (not feat_13.synchronization2)
-            continue;
+        auto [feat, feat_13] =
+            d.getFeatures2<vk::PhysicalDeviceFeatures2,
+                           vk::PhysicalDeviceVulkan13Features>();
+        if (not feat_13.synchronization2) continue;
         vk::DeviceCreateInfo create_info{.pNext = &feat};
         std::vector<const char*> required_extensions = {
             VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,
@@ -32,7 +33,6 @@ auto make_device(vk::raii::Instance& instance) {
             }
         }
         create_info.setPEnabledExtensionNames(required_extensions);
-
 
         queue encode_queue{nullptr, 0};
         queue gfx_queue{nullptr, 0};
@@ -116,6 +116,26 @@ auto create_src_image(const vk::VideoProfileListInfoKHR& prof,
                              .layerCount = 1},
     };
     auto video_fmt_props = phys_dev.getVideoFormatPropertiesKHR(video_fmt);
+    for (const auto& video_fmt_prop : video_fmt_props) {
+        std::cerr << "format: " << vk::to_string(video_fmt_prop.format)
+                  << std::endl;
+        std::cerr << "tiling: " << vk::to_string(video_fmt_prop.imageTiling)
+                  << std::endl;
+        std::cerr << "usage: " << vk::to_string(video_fmt_prop.imageUsageFlags)
+                  << std::endl;
+        std::cerr << "components: "
+                  << vk::to_string(video_fmt_prop.componentMapping.r)
+                  << std::endl
+                  << "            "
+                  << vk::to_string(video_fmt_prop.componentMapping.g)
+                  << std::endl
+                  << "            "
+                  << vk::to_string(video_fmt_prop.componentMapping.b)
+                  << std::endl
+                  << "            "
+                  << vk::to_string(video_fmt_prop.componentMapping.a)
+                  << std::endl;
+    }
     for (const auto& video_fmt_prop : video_fmt_props) {
         // TODO: select a good format if multiple ones are available
         img_view_create_info.format = img_create_info.format =
@@ -324,8 +344,10 @@ class test_pattern {
         uint32_t bar_y_w = extent.width / y.size();
 
         vk::ImageMemoryBarrier2 im_barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
             .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
             .oldLayout = vk::ImageLayout::eUndefined,
             .newLayout = vk::ImageLayout::eTransferDstOptimal,
             .image = *target_img,
@@ -335,6 +357,17 @@ class test_pattern {
                                  .baseArrayLayer = 0,
                                  .layerCount = 1},
         };
+
+        vk::BufferMemoryBarrier2 buf_barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite |
+                             vk::AccessFlagBits2::eTransferRead,
+            .dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite |
+                             vk::AccessFlagBits2::eTransferRead,
+            .buffer = *buf,
+            .size = vk::WholeSize,
+        };
         vk::DependencyInfo dep_info{};
         dep_info.setImageMemoryBarriers(im_barrier);
         cmd_buf.pipelineBarrier2(dep_info);
@@ -342,12 +375,21 @@ class test_pattern {
         for (size_t i = 0; i < y.size(); ++i) {
             size_t j = (i + shift) % y.size();
 
+            im_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
+            im_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+            im_barrier.dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
+            im_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+            im_barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+            im_barrier.newLayout = vk::ImageLayout::eTransferDstOptimal;
+            dep_info.setBufferMemoryBarriers(buf_barrier);
+
             uint32_t data;
             std::array<uint8_t, 4> val;
             val.fill((y[j] * 256) / 1024);
             std::memcpy(&data, val.data(), sizeof(data));
 
             cmd_buf.fillBuffer(*buf, 0, vk::WholeSize, data);
+            cmd_buf.pipelineBarrier2(dep_info);
 
             vk::BufferImageCopy region{
                 .imageSubresource =
@@ -370,15 +412,18 @@ class test_pattern {
                                           vk::ImageLayout::eTransferDstOptimal,
                                           region);
                 region.imageOffset.x = extent.width - bar_y_w;
+                cmd_buf.pipelineBarrier2(dep_info);
             }
             cmd_buf.copyBufferToImage(*buf, *target_img,
                                       vk::ImageLayout::eTransferDstOptimal,
                                       region);
+            cmd_buf.pipelineBarrier2(dep_info);
 
             val[2] = val[0] = (cb[j] * 256) / 1024;
             val[3] = val[1] = (cr[j] * 256) / 1024;
             std::memcpy(&data, val.data(), sizeof(data));
             cmd_buf.fillBuffer(*buf, 0, vk::WholeSize, data);
+            cmd_buf.pipelineBarrier2(dep_info);
 
             region.imageSubresource.aspectMask =
                 vk::ImageAspectFlagBits::ePlane1;
@@ -390,11 +435,17 @@ class test_pattern {
                                           vk::ImageLayout::eTransferDstOptimal,
                                           region);
                 region.imageOffset.x = 0;
+                cmd_buf.pipelineBarrier2(dep_info);
             }
             cmd_buf.copyBufferToImage(*buf, *target_img,
                                       vk::ImageLayout::eTransferDstOptimal,
                                       region);
+            cmd_buf.pipelineBarrier2(dep_info);
         }
+        im_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
+        im_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        im_barrier.dstStageMask = vk::PipelineStageFlagBits2KHR::eTopOfPipe;
+        im_barrier.dstAccessMask = vk::AccessFlagBits2::eNone;
         im_barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
         im_barrier.newLayout = vk::ImageLayout::eVideoEncodeSrcKHR;
         im_barrier.setSrcQueueFamilyIndex(src_queue);
@@ -692,6 +743,27 @@ int main(int /*argc*/, char** /*argv*/) {
 
             cmd_buffer.reset();
             cmd_buffer.begin({});
+
+            vk::ImageMemoryBarrier2 im_barrier{
+                .srcStageMask = vk::PipelineStageFlagBits2KHR::eBottomOfPipe,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2KHR::eVideoEncodeKHR,
+                .dstAccessMask = vk::AccessFlagBits2::eVideoEncodeReadKHR,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eVideoEncodeSrcKHR,
+                .srcQueueFamilyIndex = gfx_queue.familyIndex,
+                .dstQueueFamilyIndex = encode_queue.familyIndex,
+                .image = *img_in,
+                .subresourceRange = {.aspectMask =
+                                         vk::ImageAspectFlagBits::eColor,
+                                     .baseMipLevel = 0,
+                                     .levelCount = 1,
+                                     .baseArrayLayer = 0,
+                                     .layerCount = 1},
+            };
+            vk::DependencyInfo dep_info{};
+            dep_info.setImageMemoryBarriers(im_barrier);
+            cmd_buffer.pipelineBarrier2(dep_info);
             cmd_buffer.resetQueryPool(*query_pool, 0, 1);
             vk::VideoBeginCodingInfoKHR video_coding_begin_info{
                 .videoSession = *video_session,
@@ -811,7 +883,7 @@ int main(int /*argc*/, char** /*argv*/) {
             frames[slot] = frame;
 
             vk::PipelineStageFlags stage =
-                vk::PipelineStageFlagBits::eBottomOfPipe;
+                vk::PipelineStageFlagBits::eTopOfPipe;
             vk::SubmitInfo submit{};
             submit.setCommandBuffers(*cmd_buffer);
             submit.setWaitSemaphores(*sem);
