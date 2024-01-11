@@ -170,14 +170,13 @@ auto create_src_image(const vk::VideoProfileListInfoKHR& prof,
     vk::raii::ImageView img_view(dev, img_view_create_info);
 
     return std::make_tuple(std::move(img_in), std::move(img_mem),
-                           std::move(img_view),
-                           img_create_info.format);
+                           std::move(img_view), img_create_info.format);
 }
 
 auto create_dpb_images(const vk::VideoProfileListInfoKHR& prof,
                        const vk::Extent2D& extent,
                        vk::raii::PhysicalDevice& phys_dev,
-                       vk::raii::Device& dev, int slots) {
+                       vk::raii::Device& dev, uint32_t slots) {
     vk::PhysicalDeviceVideoFormatInfoKHR video_fmt{
         .pNext = &prof,
         .imageUsage = vk::ImageUsageFlagBits::eVideoEncodeDpbKHR,
@@ -187,7 +186,8 @@ auto create_dpb_images(const vk::VideoProfileListInfoKHR& prof,
         .pNext = &prof,
         .extent = {extent.width, extent.height, 1},
         .mipLevels = 1,
-        .arrayLayers = 1,
+        .arrayLayers = slots, //TODO: requires ycbcrImageArrays feature
+                              //TODO: check VkImageFormatProperties::maxArrayLayers
         .samples = vk::SampleCountFlagBits::e1,
         .sharingMode = vk::SharingMode::eExclusive,
     };
@@ -202,57 +202,39 @@ auto create_dpb_images(const vk::VideoProfileListInfoKHR& prof,
         break;
     }
 
-    std::vector<std::pair<vk::raii::Image, vk::raii::ImageView>> images;
+    vk::raii::Image img(dev, img_create_info);
 
-    size_t alloc_size = 0;
-    std::vector<size_t> offsets;
-
-    std::optional<vk::MemoryRequirements> mem_req;
-
-    for (int i = 0; i < slots; ++i) {
-        vk::raii::Image img(dev, img_create_info);
-
-        auto req = img.getMemoryRequirements();
-        if (mem_req) {
-            assert(req.memoryTypeBits == mem_req->memoryTypeBits);
-        } else {
-            mem_req = req;
-        }
-        size_t offset = ((alloc_size - 1) / req.alignment + 1) * req.alignment;
-        offsets.push_back(offset);
-        alloc_size = offset + req.size;
-
-        images.emplace_back(std::move(img), nullptr);
-    }
+    auto req = img.getMemoryRequirements();
 
     vk::MemoryAllocateInfo alloc_info{
-        .allocationSize = alloc_size,
+        .allocationSize = req.size,
         .memoryTypeIndex =
-            get_memory_type(phys_dev, mem_req->memoryTypeBits,
+            get_memory_type(phys_dev, req.memoryTypeBits,
                             vk::MemoryPropertyFlagBits::eDeviceLocal),
     };
 
     vk::raii::DeviceMemory img_mem(dev, alloc_info);
+    img.bindMemory(*img_mem, 0);
 
-    for (int i = 0; i < slots; ++i) {
-        images[i].first.bindMemory(*img_mem, offsets[i]);
+    std::vector<vk::raii::ImageView> img_views;
 
-        images[i].second = vk::raii::ImageView(
+    for (uint32_t view = 0; view < slots; ++view) {
+        img_views.emplace_back(vk::raii::ImageView(
             dev, {
-                     .image = *images[i].first,
+                     .image = *img,
                      .viewType = vk::ImageViewType::e2D,
                      .format = img_create_info.format,
                      .subresourceRange = {.aspectMask =
                                               vk::ImageAspectFlagBits::eColor,
                                           .baseMipLevel = 0,
                                           .levelCount = 1,
-                                          .baseArrayLayer = 0,
+                                          .baseArrayLayer = view,
                                           .layerCount = 1},
-                 });
+                 }));
     }
 
-    return std::make_tuple(std::move(images), std::move(img_mem),
-                           img_create_info.format);
+    return std::make_tuple(std::move(img), std::move(img_views),
+                           std::move(img_mem), img_create_info.format);
 }
 
 auto create_buffer(const vk::VideoProfileListInfoKHR& prof,
@@ -516,50 +498,53 @@ class test_pattern {
         counter += 10;
 
         std::array im_barriers = {
-        vk::ImageMemoryBarrier2 {
-            .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
-            .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eTransferDstOptimal,
-            .image = *target_img,
-            .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-                                 .baseMipLevel = 0,
-                                 .levelCount = 1,
-                                 .baseArrayLayer = 0,
-                                 .layerCount = 1},
-        },
-        vk::ImageMemoryBarrier2 {
-            .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
-            .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .image = *img_y,
-            .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-                                 .baseMipLevel = 0,
-                                 .levelCount = 1,
-                                 .baseArrayLayer = 0,
-                                 .layerCount = 1},
-        },
-        vk::ImageMemoryBarrier2 {
-            .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
-            .srcAccessMask = vk::AccessFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .image = *img_uv,
-            .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-                                 .baseMipLevel = 0,
-                                 .levelCount = 1,
-                                 .baseArrayLayer = 0,
-                                 .layerCount = 1},
-        },
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .image = *target_img,
+                .subresourceRange = {.aspectMask =
+                                         vk::ImageAspectFlagBits::eColor,
+                                     .baseMipLevel = 0,
+                                     .levelCount = 1,
+                                     .baseArrayLayer = 0,
+                                     .layerCount = 1},
+            },
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = *img_y,
+                .subresourceRange = {.aspectMask =
+                                         vk::ImageAspectFlagBits::eColor,
+                                     .baseMipLevel = 0,
+                                     .levelCount = 1,
+                                     .baseArrayLayer = 0,
+                                     .layerCount = 1},
+            },
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = *img_uv,
+                .subresourceRange = {.aspectMask =
+                                         vk::ImageAspectFlagBits::eColor,
+                                     .baseMipLevel = 0,
+                                     .levelCount = 1,
+                                     .baseArrayLayer = 0,
+                                     .layerCount = 1},
+            },
         };
-        auto & [target_barrier, y_barrier, uv_barrier] = im_barriers;
+        auto& [target_barrier, y_barrier, uv_barrier] = im_barriers;
         vk::DependencyInfo dep_info{};
         std::span yuv_barriers(im_barriers.begin() + 1, im_barriers.end());
         dep_info.setImageMemoryBarriers(yuv_barriers);
@@ -576,8 +561,8 @@ class test_pattern {
         cmd_buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0,
                                    *ds_cb_cr, {});
         cmd_buf.pushConstants<push_constant>(
-            *layout, vk::ShaderStageFlagBits::eCompute, 0, counter/2);
-        cmd_buf.dispatch(extent.width/2, extent.height/2, 1);
+            *layout, vk::ShaderStageFlagBits::eCompute, 0, counter / 2);
+        cmd_buf.dispatch(extent.width / 2, extent.height / 2, 1);
 
         y_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader;
         y_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite;
@@ -601,10 +586,10 @@ class test_pattern {
             vk::ImageCopy{
                 .srcSubresource = {.aspectMask =
                                        vk::ImageAspectFlagBits::eColor,
-                                       .layerCount = 1},
+                                   .layerCount = 1},
                 .dstSubresource = {.aspectMask =
                                        vk::ImageAspectFlagBits::ePlane0,
-                                       .layerCount = 1},
+                                   .layerCount = 1},
                 .extent = {extent.width, extent.height, 1},
             });
         cmd_buf.copyImage(
@@ -613,11 +598,11 @@ class test_pattern {
             vk::ImageCopy{
                 .srcSubresource = {.aspectMask =
                                        vk::ImageAspectFlagBits::eColor,
-                                       .layerCount = 1},
+                                   .layerCount = 1},
                 .dstSubresource = {.aspectMask =
                                        vk::ImageAspectFlagBits::ePlane1,
-                                       .layerCount = 1},
-                .extent = {extent.width/2, extent.height/2, 1},
+                                   .layerCount = 1},
+                .extent = {extent.width / 2, extent.height / 2, 1},
             });
 
         target_barrier.srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer;
@@ -685,13 +670,12 @@ int main(int /*argc*/, char** /*argv*/) {
         std::cerr << "std header " << video_caps.stdHeaderVersion.specVersion
                   << std::endl;
 
-        auto [img_in, img_in_mem, img_in_view, 
-              img_fmt] = create_src_image(prof, extent, phys_dev, dev);
+        auto [img_in, img_in_mem, img_in_view, img_fmt] =
+            create_src_image(prof, extent, phys_dev, dev);
 
-        test_pattern pattern(phys_dev, dev, img_in, img_fmt,
-                             extent);
+        test_pattern pattern(phys_dev, dev, img_in, img_fmt, extent);
 
-        auto [dpb, dpb_mem, dpb_fmt] =
+        auto [dpb_img, dpb, dpb_mem, dpb_fmt] =
             create_dpb_images(prof, extent, phys_dev, dev, 2);
 
         vk::raii::VideoSessionKHR video_session(
@@ -877,10 +861,10 @@ int main(int /*argc*/, char** /*argv*/) {
             dpb.size());
         std::vector<vk::VideoReferenceSlotInfoKHR> ref_slots(dpb.size());
         for (size_t i = 0; i < dpb.size(); ++i) {
-            ref_pics[i] = vk::VideoPictureResourceInfoKHR{
-                .codedExtent = extent,
-                .baseArrayLayer = 0,
-                .imageViewBinding = *dpb[i].second};
+            ref_pics[i] =
+                vk::VideoPictureResourceInfoKHR{.codedExtent = extent,
+                                                .baseArrayLayer = 0,
+                                                .imageViewBinding = *dpb[i]};
 
             h264_ref[i] = StdVideoEncodeH264ReferenceInfo{
                 // TODO: set data
