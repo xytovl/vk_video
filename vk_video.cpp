@@ -514,8 +514,8 @@ class test_pattern {
             vk::ImageMemoryBarrier2{
                 .srcStageMask = vk::PipelineStageFlagBits2KHR::eNone,
                 .srcAccessMask = vk::AccessFlagBits2::eNone,
-                .dstStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
                 .newLayout = vk::ImageLayout::eTransferDstOptimal,
                 .image = *target_img,
@@ -895,6 +895,7 @@ int main(int /*argc*/, char** /*argv*/) {
         }
 
         vk::raii::Fence fence(dev, vk::FenceCreateInfo{});
+        vk::raii::Fence fence1(dev, vk::FenceCreateInfo{});
         vk::raii::Semaphore sem(dev, vk::SemaphoreCreateInfo{});
 
         slot_info frames(dpb.size());
@@ -923,7 +924,7 @@ int main(int /*argc*/, char** /*argv*/) {
                 vk::SubmitInfo submit{};
                 submit.setCommandBuffers(*gfx_cmd_buffer);
                 submit.setSignalSemaphores(*sem);
-                gfx_queue.queue.submit(submit);
+                gfx_queue.queue.submit(submit, *fence);
             }
 
             cmd_buffer.reset();
@@ -1079,8 +1080,9 @@ int main(int /*argc*/, char** /*argv*/) {
             submit.setCommandBuffers(*cmd_buffer);
             submit.setWaitSemaphores(*sem);
             submit.setWaitDstStageMask(stage);
-            encode_queue.queue.submit(submit, *fence);
-            auto res = dev.waitForFences(*fence, true, 1'000'000'000);
+            encode_queue.queue.submit(submit, *fence1);
+            std::array fences{*fence, *fence1};
+            auto res = dev.waitForFences(fences, true, 1'000'000'000);
             if (res != vk::Result::eSuccess) {
                 throw std::runtime_error("wait for fences: " +
                                          vk::to_string(res));
@@ -1099,7 +1101,7 @@ int main(int /*argc*/, char** /*argv*/) {
                 out.write((char*)mapped_buffer, size[1]);
                 out.flush();
             }
-            dev.resetFences(*fence);
+            dev.resetFences(fences);
         }
 
     } catch (std::exception& e) {
