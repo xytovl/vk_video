@@ -1,15 +1,21 @@
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <vector>
 #include <vulkan/vulkan_raii.hpp>
 
 #include "pattern_cb_cr.h"
 #include "pattern_y.h"
 
+// Use random frame as a reference, randomly insert references
+//#define DPB_CHAOS_MODE
+
 struct queue {
     vk::raii::Queue queue;
     uint32_t familyIndex;
 };
+
+static const int dpb_slots = 4;
 
 auto make_device(vk::raii::Instance& instance) {
     vk::raii::PhysicalDevices physicalDevices(instance);
@@ -186,8 +192,9 @@ auto create_dpb_images(const vk::VideoProfileListInfoKHR& prof,
         .pNext = &prof,
         .extent = {extent.width, extent.height, 1},
         .mipLevels = 1,
-        .arrayLayers = slots, //TODO: requires ycbcrImageArrays feature
-                              //TODO: check VkImageFormatProperties::maxArrayLayers
+        .arrayLayers =
+            slots,  // TODO: requires ycbcrImageArrays feature
+                    // TODO: check VkImageFormatProperties::maxArrayLayers
         .samples = vk::SampleCountFlagBits::e1,
         .sharingMode = vk::SharingMode::eExclusive,
     };
@@ -264,6 +271,7 @@ auto create_buffer(const vk::VideoProfileListInfoKHR& prof,
 
 class slot_info {
     std::vector<int32_t> frames;
+    std::mt19937 rnd;
 
    public:
     slot_info(size_t size) : frames(size, -1) {}
@@ -276,8 +284,13 @@ class slot_info {
     int32_t& operator[](size_t slot) { return frames[slot]; }
 
     std::optional<size_t> get_ref() {
+#ifdef DPB_CHAOS_MODE
+        size_t i = rnd() % frames.size();
+        if (frames[i] >= 0 and i != get_slot()) return i;
+#else
         auto i = std::ranges::max_element(frames);
         if (*i >= 0) return i - std::begin(frames);
+#endif
         return {};
     }
 };
@@ -670,13 +683,15 @@ int main(int /*argc*/, char** /*argv*/) {
         std::cerr << "std header " << video_caps.stdHeaderVersion.specVersion
                   << std::endl;
 
+        assert(dpb_slots <= video_caps.maxDpbSlots);
+
         auto [img_in, img_in_mem, img_in_view, img_fmt] =
             create_src_image(prof, extent, phys_dev, dev);
 
         test_pattern pattern(phys_dev, dev, img_in, img_fmt, extent);
 
         auto [dpb_img, dpb, dpb_mem, dpb_fmt] =
-            create_dpb_images(prof, extent, phys_dev, dev, 2);
+            create_dpb_images(prof, extent, phys_dev, dev, dpb_slots);
 
         vk::raii::VideoSessionKHR video_session(
             dev,
@@ -688,7 +703,7 @@ int main(int /*argc*/, char** /*argv*/) {
                 .pictureFormat = img_fmt,
                 .maxCodedExtent = extent,
                 .referencePictureFormat = dpb_fmt,
-                .maxDpbSlots = 2,
+                .maxDpbSlots = dpb_slots,
                 .maxActiveReferencePictures = 1,
                 .pStdHeaderVersion = &video_caps.stdHeaderVersion,
             });
@@ -888,6 +903,11 @@ int main(int /*argc*/, char** /*argv*/) {
             std::cerr << "encoding frame " << frame << std::endl;
             size_t slot = frames.get_slot();
             auto ref = frames.get_ref();
+            std::cerr << "DPB slot " << slot << " ref ";
+            if (ref)
+                std::cerr << *ref << std::endl;
+            else
+                std::cerr << "[none]" << std::endl;
             assert(not(ref and (*ref == slot)));
 
             ref_slots[slot].slotIndex = -1;
@@ -963,33 +983,39 @@ int main(int /*argc*/, char** /*argv*/) {
             vk::VideoEncodeH264NaluSliceInfoKHR nalu{
                 .pStdSliceHeader = &std_slice,
             };
-            std::vector<StdVideoEncodeH264ReferenceListsInfo> refs;
+            StdVideoEncodeH264ReferenceListsInfo ref_info{
+                .flags =
+                    {
+                        .ref_pic_list_modification_flag_l0 = 0,
+                        .ref_pic_list_modification_flag_l1 = 0,
+                        .reserved = 0,
+                    },
+                .num_ref_idx_l0_active_minus1 = 0,
+                .num_ref_idx_l1_active_minus1 = 0,
+                .RefPicList0 = {},
+                .RefPicList1 = {},
+                .refList0ModOpCount = 0,
+                .refList1ModOpCount = 0,
+                .refPicMarkingOpCount = 0,
+                .reserved1 = {},
+                .pRefList0ModOperations = nullptr,
+                .pRefList1ModOperations = nullptr,
+                .pRefPicMarkingOperations = nullptr,
+            };
+            std::fill(ref_info.RefPicList0,
+                      ref_info.RefPicList0 + sizeof(ref_info.RefPicList0),
+                      STD_VIDEO_H264_NO_REFERENCE_PICTURE);
+            std::fill(ref_info.RefPicList1,
+                      ref_info.RefPicList1 + sizeof(ref_info.RefPicList1),
+                      STD_VIDEO_H264_NO_REFERENCE_PICTURE);
+            StdVideoEncodeH264RefPicMarkingEntry ref_marking{};
             if (ref) {
-                auto& i =
-                    refs.emplace_back(StdVideoEncodeH264ReferenceListsInfo{
-                        .flags =
-                            {
-                                .ref_pic_list_modification_flag_l0 = 0,
-                                .ref_pic_list_modification_flag_l1 = 0,
-                                .reserved = 0,
-                            },
-                        .num_ref_idx_l0_active_minus1 = 0,
-                        .num_ref_idx_l1_active_minus1 = 0,
-                        .RefPicList0 = {},
-                        .RefPicList1 = {},
-                        .refList0ModOpCount = 0,
-                        .refList1ModOpCount = 0,
-                        .refPicMarkingOpCount = 0,
-                        .reserved1 = {},
-                        .pRefList0ModOperations = nullptr,
-                        .pRefList1ModOperations = nullptr,
-                        .pRefPicMarkingOperations = nullptr,
-                    });
-                std::fill(i.RefPicList0, i.RefPicList0 + sizeof(i.RefPicList0),
-                          STD_VIDEO_H264_NO_REFERENCE_PICTURE);
-                std::fill(i.RefPicList1, i.RefPicList1 + sizeof(i.RefPicList1),
-                          STD_VIDEO_H264_NO_REFERENCE_PICTURE);
-                i.RefPicList0[0] = *ref;
+                ref_info.RefPicList0[0] = *ref;
+            } else {
+                ref_marking.memory_management_control_operation =
+                    STD_VIDEO_H264_MEM_MGMT_CONTROL_OP_UNMARK_ALL;
+                ref_info.refPicMarkingOpCount = 1;
+                ref_info.pRefPicMarkingOperations = &ref_marking;
             }
             StdVideoEncodeH264PictureInfo std_pic_info{
                 .flags =
@@ -1010,7 +1036,7 @@ int main(int /*argc*/, char** /*argv*/) {
                 .PicOrderCnt = 0,
                 .temporal_id = 0,
                 .reserved1 = {},
-                .pRefLists = ref ? refs.data() : nullptr,
+                .pRefLists = &ref_info,
             };
             vk::VideoEncodeH264PictureInfoKHR pic_info{
                 .pStdPictureInfo = &std_pic_info,
