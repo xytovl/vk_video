@@ -4,24 +4,27 @@ project('vk_video', 'cpp',
                      'cpp_std=c++20'])
 
 add_global_arguments('-DVULKAN_HPP_NO_CONSTRUCTORS', language: 'cpp')
+add_global_arguments('-DVULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1', language: 'cpp')
 
 vk = dependency('vulkan')
 
 glsllang = find_program('glslangValidator')
 
 
-y = custom_target('pattern_y',
-  output: 'pattern_y.h',
+pattern = custom_target('pattern',
+  output: 'spirv_pattern.h',
   input: 'pattern.comp',
-  command: [glsllang, '-V', '@INPUT@', '-o', '@OUTPUT@', '--vn', 'spirv_pattern_y', '-DY']
-  )
-cb_cr = custom_target('pattern_cb_cr',
-  output: 'pattern_cb_cr.h',
-  input: 'pattern.comp',
-  command: [glsllang, '-V', '@INPUT@', '-o', '@OUTPUT@', '--vn', 'spirv_pattern_cb_cr']
+  command: [glsllang, '-V', '@INPUT@', '-o', '@OUTPUT@', '--vn', 'spirv_pattern']
   )
 
-exe = executable('vk_video', ['vk_video.cpp', y, cb_cr],
+exe = executable('vk_video',
+  ['vk_video.cpp',
+   'video_encoder.cpp',
+   'video_encoder_h264.cpp',
+   'slot_info.cpp',
+   'test_pattern.cpp',
+   'memory_allocator.cpp',
+   pattern],
   dependencies: [vk],
   install : true)
 

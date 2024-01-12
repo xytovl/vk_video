@@ -5,11 +5,10 @@ layout (push_constant) uniform UBO {
 	}
 ;
 
-#ifdef Y
-layout(r16f, set = 0, binding = 0) uniform image2D image;
-#else
-layout(rg16f, set = 0, binding = 0) uniform image2D image;
-#endif
+layout(r16f, set = 0, binding = 0) uniform writeonly image2D image_y;
+layout(rg16f, set = 0, binding = 1) uniform writeonly image2D image_uv;
+
+layout (local_size_x = 16, local_size_y = 16) in;
 
 const uint num_stripes = 8;
 const uint[] y = {940, 877, 754, 691, 313, 250, 127, 64};
@@ -18,19 +17,19 @@ const uint[] cr = {512, 553, 64, 105, 919, 960, 471, 512};
 
 void main() {
 	ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
-	ivec2 size = imageSize(image);
+	ivec2 size = imageSize(image_y);
 	uint stripe = ((num_stripes * (texelCoord.x + counter)) / size.x) % num_stripes;
 
 	if (texelCoord.x < size.x && texelCoord.y < size.y) {
 		vec4 color = vec4(0.0, 0.0, 0.0, 1.0);
 
-#ifdef Y
 		color.x = y[stripe] * 0.001;
-#else
+
+		imageStore(image_y, texelCoord, color);
+
+		texelCoord /= 2;
 		color.x = cb[stripe] * 0.001;
 		color.y = cr[stripe] * 0.001;
-#endif
-
-		imageStore(image, texelCoord, color);
+		imageStore(image_uv, texelCoord, color);
 	}
 }
